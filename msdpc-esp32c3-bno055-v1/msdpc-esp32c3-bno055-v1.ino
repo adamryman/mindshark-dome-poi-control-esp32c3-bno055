@@ -111,6 +111,7 @@ void loop(void) {
 
   if (w == 0 && x == 0 && y == 0 && z == 0) {
     PRINTF("Invalid quaternion detected, skipping...\n");
+    delay(100);
     return; // Skip this loop iteration if the quaternion is invalid
   }
   if (old_w == 0 && old_x == 0 && old_y == 0 && old_z == 0) {
@@ -142,7 +143,7 @@ void loop(void) {
     int16_t scaled_z = static_cast<int16_t>(z * 16384);
 
     // Scale the average distance before sending
-    uint16_t scaled_average_distance = static_cast<uint16_t>((average_distance / (10.0f * M_PI)) * 65535.0f);
+    uint16_t scaled_average_distance = static_cast<uint16_t>((average_distance / 2.0 * (M_PI)) * 65535.0f);
 
     conn.beginPacket(dome_ip, 5005);
     conn.write(reinterpret_cast<uint8_t*>(&id), sizeof(id));
