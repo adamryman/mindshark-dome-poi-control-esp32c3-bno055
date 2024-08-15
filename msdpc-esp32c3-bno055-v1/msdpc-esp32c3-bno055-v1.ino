@@ -143,7 +143,7 @@ void loop(void) {
     int16_t scaled_z = static_cast<int16_t>(z * 16384);
 
     // Scale the average distance before sending
-    uint16_t scaled_average_distance = static_cast<uint16_t>((average_distance / 2.0 * (M_PI)) * 65535.0f);
+    uint16_t scaled_average_distance = static_cast<uint16_t>((average_distance / M_PI) * 65535.0f);
 
     conn.beginPacket(dome_ip, 5005);
     conn.write(reinterpret_cast<uint8_t*>(&id), sizeof(id));
