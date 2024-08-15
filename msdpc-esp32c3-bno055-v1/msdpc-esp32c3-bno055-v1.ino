@@ -6,19 +6,27 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Adafruit_BNO055.h>
-#include <deque>  // Include the deque library for buffer
 
 Adafruit_BNO055 bno = Adafruit_BNO055(-1, 0x28);
 
-const int button_1_pin = 3;
-const int button_2_pin = 9;
-
 const int DATAGRAM_REPEATS = 10;
-const int BUFFER_SIZE = 100;  // Size of the buffer for angular velocities
 
-int old_button_1_state = 0;
-int old_button_2_state = 0;
-int button_1_2_hold_counter = 0;
+// Window time limits in milliseconds
+const unsigned long SHORT_WINDOW = 10000;  // 10 seconds
+const unsigned long MID_WINDOW = 30000;    // 30 seconds
+const unsigned long LONG_WINDOW = 60000;   // 60 seconds
+
+// Variables for cumulative sums and time
+float cumulative_distance_short = 0.0f;
+unsigned long cumulative_time_short = 0;
+
+float cumulative_distance_mid = 0.0f;
+unsigned long cumulative_time_mid = 0;
+
+float cumulative_distance_long = 0.0f;
+unsigned long cumulative_time_long = 0;
+
+unsigned long last_time = 0;  // To track the last update time
 
 WiFiUDP conn;
 uint8_t id;
@@ -27,15 +35,8 @@ int16_t old_x = 0;
 int16_t old_y = 0;
 int16_t old_z = 0;
 uint8_t action_flag = 0;
-int action_flag_repeats = 0;
 
-std::deque<float> angular_vel_buffer; // Buffer for storing angular velocities
-
-uint16_t avg_angular_vel_short = 0;  // Average over short period
-uint16_t avg_angular_vel_mid = 0;    // Average over medium period
-uint16_t avg_angular_vel_long = 0;   // Average over long period
-
-unsigned long last_time = 0;  // To store the time of the last quaternion update
+const uint8_t DEVICE_TYPE = 2;  // Define device type 2 as poi
 
 void setup(void)
 {
@@ -46,7 +47,6 @@ void setup(void)
   digitalWrite(0, HIGH);
   Wire.setPins(1, 10);
   
-
   PRINTLN("Connecting to wifi");
   // Populated in secrets.h
   WiFi.begin(ssid, password);
@@ -61,35 +61,16 @@ void setup(void)
   PRINTLN("UDP client created");
   id = WiFi.localIP()[3];
 
-  pinMode(button_1_pin, INPUT_PULLUP);
-  pinMode(button_2_pin, INPUT_PULLUP);
-
-  PRINTF("Configuring BNO055");
+  PRINTLN("Configuring BNO055");
   bno.begin(OPERATION_MODE_NDOF);
   bno.setExtCrystalUse(true);
   PRINTLN("Setup completed");
+
+  last_time = millis();  // Initialize the last time
 }
 
 void loop(void)
 {
-  int button_1_state = digitalRead(button_1_pin);
-  int button_2_state = digitalRead(button_2_pin);
-  if (action_flag == 0) {
-    if (button_1_state != old_button_1_state && button_1_state == LOW) {
-      action_flag = 1;
-    }
-    if (button_2_state != old_button_2_state && button_2_state == LOW) {
-      action_flag = 2;
-    }
-    if (button_1_state == old_button_1_state && button_2_state == old_button_2_state && button_1_state == LOW && button_2_state == LOW) {
-      button_1_2_hold_counter++;
-    }
-    if (button_1_2_hold_counter > 500) {
-      action_flag = 4;
-      button_1_2_hold_counter = 0;
-    }
-  }
-
   imu::Quaternion quat = bno.getQuat();
   int16_t w = quat.w() * 16384;
   int16_t x = quat.x() * 16384;
@@ -98,45 +79,57 @@ void loop(void)
 
   if(old_w != w || old_x != x || old_y != y || old_z != z) {
     unsigned long current_time = millis();
-    float time_diff = (current_time - last_time) / 1000.0;  // Time difference in seconds
+    unsigned long time_diff = current_time - last_time;
 
-    // Calculate the angular velocity using the quaternion difference
-    float angle = 2 * acos(old_w * quat.w() + old_x * quat.x() + old_y * quat.y() + old_z * quat.z());
-    float angular_velocity = angle / time_diff;
+    // Calculate the angular distance using the quaternion difference
+    float dot_product = old_w * w + old_x * x + old_y * y + old_z * z;
+    dot_product = fminf(fmaxf(dot_product, -1.0f), 1.0f);  // Ensure dot product is within valid range
+    float angle = 2 * acos(dot_product);  // Compute the angular distance (radians)
 
-    // Store the angular velocity in the buffer
-    if (angular_vel_buffer.size() >= BUFFER_SIZE) {
-      angular_vel_buffer.pop_front();  // Remove oldest if buffer is full
-    }
-    angular_vel_buffer.push_back(angular_velocity);
 
-    // Calculate averages over different periods
-    avg_angular_vel_short = calculateAverage(angular_vel_buffer, 10);
-    avg_angular_vel_mid = calculateAverage(angular_vel_buffer, 50);
-    avg_angular_vel_long = calculateAverage(angular_vel_buffer, 100);
+    // Update cumulative distances and times for each window
+    updateWindow(cumulative_distance_short, cumulative_time_short, angle, time_diff, SHORT_WINDOW);
+    updateWindow(cumulative_distance_mid, cumulative_time_mid, angle, time_diff, MID_WINDOW);
+    updateWindow(cumulative_distance_long, cumulative_time_long, angle, time_diff, LONG_WINDOW);
+
+    // Calculate average angular distances for each window
+    float average_distance_short = calculateAverageDistance(cumulative_distance_short, cumulative_time_short);
+    float average_distance_mid = calculateAverageDistance(cumulative_distance_mid, cumulative_time_mid);
+    float average_distance_long = calculateAverageDistance(cumulative_distance_long, cumulative_time_long);
 
     conn.beginPacket(dome_ip, 5005);
     conn.write(reinterpret_cast<uint8_t*>(&id), sizeof(id));
     conn.write(reinterpret_cast<const uint8_t*>(&current_time), sizeof(current_time));
+    conn.write(&DEVICE_TYPE, sizeof(DEVICE_TYPE));  // Send the device type
     conn.write(reinterpret_cast<uint8_t*>(&w), sizeof(w));
     conn.write(reinterpret_cast<uint8_t*>(&x), sizeof(x));
     conn.write(reinterpret_cast<uint8_t*>(&y), sizeof(y));
     conn.write(reinterpret_cast<uint8_t*>(&z), sizeof(z));
     conn.write(reinterpret_cast<uint8_t*>(&action_flag), sizeof(action_flag));
 
-    // Send the averages
-    conn.write(reinterpret_cast<uint8_t*>(&avg_angular_vel_short), sizeof(avg_angular_vel_short));
-    conn.write(reinterpret_cast<uint8_t*>(&avg_angular_vel_mid), sizeof(avg_angular_vel_mid));
-    conn.write(reinterpret_cast<uint8_t*>(&avg_angular_vel_long), sizeof(avg_angular_vel_long));
+   
+    /*
+    uint16_t val1 = 2;
+    uint16_t val2 = 32767;
+    uint16_t val3 = 52767;
+    
+    
+    uint16_t val1 = htons(2);
+    uint16_t val2 = htons(32767);
+    uint16_t val3 = htons(52767);
+    
+    conn.write(reinterpret_cast<uint8_t*>(&val1), sizeof(val1));
+    conn.write(reinterpret_cast<uint8_t*>(&val2), sizeof(val2));
+    conn.write(reinterpret_cast<uint8_t*>(&val3), sizeof(val3));
+    */
+    
+
+    // Send the average angular distances for different windows
+    conn.write(reinterpret_cast<uint8_t*>(&average_distance_short), sizeof(average_distance_short));
+    conn.write(reinterpret_cast<uint8_t*>(&average_distance_mid), sizeof(average_distance_mid));
+    conn.write(reinterpret_cast<uint8_t*>(&average_distance_long), sizeof(average_distance_long));
     
     conn.endPacket();
-
-    if (action_flag != 0 && action_flag_repeats > DATAGRAM_REPEATS) {
-      action_flag = 0;
-      action_flag_repeats = 0;
-    } else if (action_flag != 0) {
-      action_flag_repeats++;
-    }
 
     old_w = w;
     old_x = x;
@@ -145,16 +138,20 @@ void loop(void)
 
     last_time = current_time;  // Update the last time variable
   }
-
-  old_button_1_state = button_1_state;
-  old_button_2_state = button_2_state;
 }
 
-uint16_t calculateAverage(const std::deque<float>& buffer, int period) {
-  if (buffer.size() < period) period = buffer.size();  // Adjust period if buffer is not full
-  float sum = 0;
-  for (int i = buffer.size() - period; i < buffer.size(); i++) {
-    sum += buffer[i];
+void updateWindow(float &cumulative_distance, unsigned long &cumulative_time, float angle, unsigned long time_diff, unsigned long window_limit) {
+  cumulative_distance += angle;
+  cumulative_time += time_diff;
+
+  // If cumulative time exceeds window limit, scale down
+  if (cumulative_time > window_limit) {
+    float scale_factor = (float)window_limit / cumulative_time;
+    cumulative_distance *= scale_factor;
+    cumulative_time = window_limit;
   }
-  return static_cast<uint16_t>(sum / period);
+}
+
+float calculateAverageDistance(float cumulative_distance, unsigned long cumulative_time) {
+  return cumulative_time > 0 ? cumulative_distance / (cumulative_time / 1000.0) : 0.0f;
 }
