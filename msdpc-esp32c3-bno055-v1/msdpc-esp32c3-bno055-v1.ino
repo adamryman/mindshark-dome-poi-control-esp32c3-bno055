@@ -7,147 +7,157 @@
 #include <WiFiUdp.h>
 #include <Adafruit_BNO055.h>
 #include <stdint.h>
+#include <deque>
+#include <algorithm>
+#include <cmath>
 
 Adafruit_BNO055 bno = Adafruit_BNO055(-1, 0x28);
 
-const int DATAGRAM_REPEATS = 10;
-
-// Window time limits in milliseconds
-const unsigned long SHORT_WINDOW = 10000;  // 10 seconds
-const unsigned long MID_WINDOW = 30000;    // 30 seconds
-const unsigned long LONG_WINDOW = 60000;   // 60 seconds
-
-// Variables for cumulative sums and time using uint32_t
-uint32_t cumulative_distance_short = 0;
-uint32_t cumulative_time_short = 0;
-
-uint32_t cumulative_distance_mid = 0;
-uint32_t cumulative_time_mid = 0;
-
-uint32_t cumulative_distance_long = 0;
-uint32_t cumulative_time_long = 0;
-
-unsigned long last_time = 0;  // To track the last update time
-
+unsigned long last_time = 0;
 WiFiUDP conn;
 uint8_t id;
-int16_t old_w = 0;
-int16_t old_x = 0;
-int16_t old_y = 0;
-int16_t old_z = 0;
+float old_w = 0;
+float old_x = 0;
+float old_y = 0;
+float old_z = 0;
 uint8_t action_flag = 0;
 
-const uint8_t DEVICE_TYPE = 2;  // Define device type 2 as poi
+const uint8_t DEVICE_TYPE = 2;
+const int BUFFER_SIZE = 100;
+std::deque<float> distanceBuffer;  // Using deque of floats to store distances
+int lastTimestamp = 0;
 
-const uint32_t MAX_ANGLE_INT = 36000;  // Scaling factor for angle (e.g., 1 degree = 100 units)
-
-void setup(void)
-{
+void setup(void) {
   SETUP_SERIAL();
   delay(10);
-  PRINTLN("Starting up...");
+  PRINTF("Starting up...\n");
   pinMode(0, OUTPUT);
   digitalWrite(0, HIGH);
   Wire.setPins(1, 10);
   
-  PRINTLN("Connecting to wifi");
-  // Populated in secrets.h
+  PRINTF("Connecting to wifi\n");
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(100);
-    PRINT(".");
+    PRINTF(".");
   }
-  PRINTLN();
-  PRINTLN("Connected to wifi");
+  PRINTF("\nConnected to wifi\n");
   PRINTF("IP address: %s\n", WiFi.localIP().toString().c_str());
   conn.begin(5004);
-  PRINTLN("UDP client created");
+  PRINTF("UDP client created\n");
   id = WiFi.localIP()[3];
 
-  PRINTLN("Configuring BNO055");
+  PRINTF("Configuring BNO055\n");
   bno.begin(OPERATION_MODE_NDOF);
   bno.setExtCrystalUse(true);
-  PRINTLN("Setup completed");
+  PRINTF("Setup completed\n");
 
-  last_time = millis();  // Initialize the last time
+  last_time = millis();
 }
 
-void loop(void)
-{
+float CalculateWeightedDistance(float old_w, float old_x, float old_y, float old_z,
+                                float w, float x, float y, float z, int timeDiff) {
+  // Calculate dot product
+  float dot_product = old_w * w + old_x * x + old_y * y + old_z * z;
+  dot_product = fminf(fmaxf(dot_product, -1.0f), 1.0f); // Clamp to valid range
+  float angle = 2 * acos(dot_product); // Calculate angular distance in radians
+
+  // Multiply the angle by time difference
+  float weighted_angle = angle * static_cast<float>(timeDiff);
+
+  return weighted_angle; // Return the weighted angle as a float
+}
+
+void StoreOrientation(int timestamp, float w, float x, float y, float z) {
+  if (distanceBuffer.size() == BUFFER_SIZE) {
+    distanceBuffer.pop_front(); // Remove the oldest entry if buffer is full
+  }
+  
+  int timeDiff = timestamp - lastTimestamp;
+  float weightedDistance = CalculateWeightedDistance(old_w, old_x, old_y, old_z, w, x, y, z, timeDiff);
+
+  // Store the weighted distance in the buffer
+  distanceBuffer.push_back(weightedDistance);
+
+  // Update last orientation and timestamp
+  old_w = w;
+  old_x = x;
+  old_y = y;
+  old_z = z;
+  lastTimestamp = timestamp;
+}
+
+float CalculateAverageDistance() {
+  if (distanceBuffer.empty()) {
+    return 0;
+  }
+
+  float totalDistance = 0.0f;
+  for (const auto &weightedDistance : distanceBuffer) {
+    totalDistance += weightedDistance;
+  }
+
+  float averageDistance = totalDistance / distanceBuffer.size();
+  PRINTF("Average Distance: %f\n", averageDistance);
+  return averageDistance;
+}
+
+void loop(void) {
   imu::Quaternion quat = bno.getQuat();
-  int16_t w = quat.w() * 16384;
-  int16_t x = quat.x() * 16384;
-  int16_t y = quat.y() * 16384;
-  int16_t z = quat.z() * 16384;
+  float w = quat.w();
+  float x = quat.x();
+  float y = quat.y();
+  float z = quat.z();
 
-  if(old_w != w || old_x != x || old_y != y || old_z != z) {
-    unsigned long current_time = millis();
-    unsigned long time_diff = current_time - last_time;
-
-    // Calculate the angular distance using the quaternion difference
-    int32_t dot_product = old_w * w + old_x * x + old_y * y + old_z * z;
-    int32_t angle = calculateScaledAngle(dot_product);  // Compute the scaled angular distance
-
-    // Update cumulative distances and times for each window
-    updateWindow(cumulative_distance_short, cumulative_time_short, angle, time_diff, SHORT_WINDOW);
-    updateWindow(cumulative_distance_mid, cumulative_time_mid, angle, time_diff, MID_WINDOW);
-    updateWindow(cumulative_distance_long, cumulative_time_long, angle, time_diff, LONG_WINDOW);
-
-    // Scale the accumulated distances to 16-bit
-    uint16_t scaled_distance_short = scaleToUint16(cumulative_distance_short, cumulative_time_short, SHORT_WINDOW);
-    uint16_t scaled_distance_mid = scaleToUint16(cumulative_distance_mid, cumulative_time_mid, MID_WINDOW);
-    uint16_t scaled_distance_long = scaleToUint16(cumulative_distance_long, cumulative_time_long, LONG_WINDOW);
-
-    conn.beginPacket(dome_ip, 5005);
-    conn.write(reinterpret_cast<uint8_t*>(&id), sizeof(id));
-    conn.write(reinterpret_cast<const uint8_t*>(&current_time), sizeof(current_time));
-    conn.write(&DEVICE_TYPE, sizeof(DEVICE_TYPE));  // Send the device type
-    conn.write(reinterpret_cast<uint8_t*>(&w), sizeof(w));
-    conn.write(reinterpret_cast<uint8_t*>(&x), sizeof(x));
-    conn.write(reinterpret_cast<uint8_t*>(&y), sizeof(y));
-    conn.write(reinterpret_cast<uint8_t*>(&z), sizeof(z));
-    conn.write(reinterpret_cast<uint8_t*>(&action_flag), sizeof(action_flag));
-
-    // Send the scaled average angular distances for different windows
-    conn.write(reinterpret_cast<uint8_t*>(&scaled_distance_short), sizeof(scaled_distance_short));
-    conn.write(reinterpret_cast<uint8_t*>(&scaled_distance_mid), sizeof(scaled_distance_mid));
-    conn.write(reinterpret_cast<uint8_t*>(&scaled_distance_long), sizeof(scaled_distance_long));
-    
-    conn.endPacket();
-
+  if (w == 0 && x == 0 && y == 0 && z == 0) {
+    PRINTF("Invalid quaternion detected, skipping...\n");
+    return; // Skip this loop iteration if the quaternion is invalid
+  }
+  if (old_w == 0 && old_x == 0 && old_y == 0 && old_z == 0) {
+    PRINTF("Storing first valid quaternion\n");
     old_w = w;
     old_x = x;
     old_y = y;
     old_z = z;
-
-    last_time = current_time;  // Update the last time variable
+    return; // Skip this loop iteration if the quaternion is invalid
   }
-}
 
-int32_t calculateScaledAngle(int32_t dot_product) {
-  // Ensure dot_product is within valid range
-  dot_product = fminf(fmaxf(dot_product, -16384 * 16384), 16384 * 16384);
-  // Scale the angle as an integer (e.g., 1 degree = 100 units)
-  // Here we assume dot_product is between -1 and 1 after scaling, we can calculate angle in "scaled units"
-  return (int32_t)(acos((float)dot_product / (16384.0f * 16384.0f)) * (MAX_ANGLE_INT / 6.28319f));
-}
-
-void updateWindow(uint32_t &cumulative_distance, uint32_t &cumulative_time, uint32_t angle, unsigned long time_diff, unsigned long window_limit) {
-  cumulative_distance += angle;
-  cumulative_time += time_diff;
-
-  // If cumulative time exceeds window limit, scale down
-  if (cumulative_time > window_limit) {
-    uint32_t scale_factor = (cumulative_time / window_limit);
-    cumulative_distance /= scale_factor;
-    cumulative_time = window_limit;
+  if (old_w == w && old_x == x && old_y == y && old_z == z) {
+    delay(10);
+    return;
   }
-}
 
-uint16_t scaleToUint16(uint32_t cumulative_distance, uint32_t cumulative_time, unsigned long window_limit) {
-  if (cumulative_time == 0) return 0;
-  
-  // Scale the cumulative distance to a 16-bit range
-  uint32_t average_distance = cumulative_distance / (cumulative_time / 1000.0);  // Get average distance per second
-  return (uint16_t)((average_distance * 65535) / MAX_ANGLE_INT);
+  PRINTF("Quaternion: w = %f, x = %f, y = %f, z = %f\n", w, x, y, z);
+
+  if (old_w != w || old_x != x || old_y != y || old_z != z) {
+    int current_time = millis();
+
+    StoreOrientation(current_time, w, x, y, z);
+    float average_distance = CalculateAverageDistance();
+
+    // Scale quaternion components for network transmission
+    int16_t scaled_w = static_cast<int16_t>(w * 16384);
+    int16_t scaled_x = static_cast<int16_t>(x * 16384);
+    int16_t scaled_y = static_cast<int16_t>(y * 16384);
+    int16_t scaled_z = static_cast<int16_t>(z * 16384);
+
+    // Scale the average distance before sending
+    uint16_t scaled_average_distance = static_cast<uint16_t>((average_distance / (10.0f * M_PI)) * 65535.0f);
+
+    conn.beginPacket(dome_ip, 5005);
+    conn.write(reinterpret_cast<uint8_t*>(&id), sizeof(id));
+    conn.write(reinterpret_cast<const uint8_t*>(&current_time), sizeof(current_time));
+    conn.write(&DEVICE_TYPE, sizeof(DEVICE_TYPE));
+    conn.write(reinterpret_cast<uint8_t*>(&scaled_w), sizeof(scaled_w));
+    conn.write(reinterpret_cast<uint8_t*>(&scaled_x), sizeof(scaled_x));
+    conn.write(reinterpret_cast<uint8_t*>(&scaled_y), sizeof(scaled_y));
+    conn.write(reinterpret_cast<uint8_t*>(&scaled_z), sizeof(scaled_z));
+    conn.write(reinterpret_cast<uint8_t*>(&action_flag), sizeof(action_flag));
+
+    conn.write(reinterpret_cast<uint8_t*>(&scaled_average_distance), sizeof(scaled_average_distance));
+    
+    conn.endPacket();
+
+    last_time = current_time;
+  }
 }
