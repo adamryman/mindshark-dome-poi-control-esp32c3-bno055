@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Adafruit_BNO055.h>
+#include <stdint.h>
 
 Adafruit_BNO055 bno = Adafruit_BNO055(-1, 0x28);
 
@@ -16,15 +17,15 @@ const unsigned long SHORT_WINDOW = 10000;  // 10 seconds
 const unsigned long MID_WINDOW = 30000;    // 30 seconds
 const unsigned long LONG_WINDOW = 60000;   // 60 seconds
 
-// Variables for cumulative sums and time
-float cumulative_distance_short = 0.0f;
-unsigned long cumulative_time_short = 0;
+// Variables for cumulative sums and time using uint32_t
+uint32_t cumulative_distance_short = 0;
+uint32_t cumulative_time_short = 0;
 
-float cumulative_distance_mid = 0.0f;
-unsigned long cumulative_time_mid = 0;
+uint32_t cumulative_distance_mid = 0;
+uint32_t cumulative_time_mid = 0;
 
-float cumulative_distance_long = 0.0f;
-unsigned long cumulative_time_long = 0;
+uint32_t cumulative_distance_long = 0;
+uint32_t cumulative_time_long = 0;
 
 unsigned long last_time = 0;  // To track the last update time
 
@@ -37,6 +38,8 @@ int16_t old_z = 0;
 uint8_t action_flag = 0;
 
 const uint8_t DEVICE_TYPE = 2;  // Define device type 2 as poi
+
+const uint32_t MAX_ANGLE_INT = 36000;  // Scaling factor for angle (e.g., 1 degree = 100 units)
 
 void setup(void)
 {
@@ -82,20 +85,18 @@ void loop(void)
     unsigned long time_diff = current_time - last_time;
 
     // Calculate the angular distance using the quaternion difference
-    float dot_product = old_w * w + old_x * x + old_y * y + old_z * z;
-    dot_product = fminf(fmaxf(dot_product, -1.0f), 1.0f);  // Ensure dot product is within valid range
-    float angle = 2 * acos(dot_product);  // Compute the angular distance (radians)
-
+    int32_t dot_product = old_w * w + old_x * x + old_y * y + old_z * z;
+    int32_t angle = calculateScaledAngle(dot_product);  // Compute the scaled angular distance
 
     // Update cumulative distances and times for each window
     updateWindow(cumulative_distance_short, cumulative_time_short, angle, time_diff, SHORT_WINDOW);
     updateWindow(cumulative_distance_mid, cumulative_time_mid, angle, time_diff, MID_WINDOW);
     updateWindow(cumulative_distance_long, cumulative_time_long, angle, time_diff, LONG_WINDOW);
 
-    // Calculate average angular distances for each window
-    float average_distance_short = calculateAverageDistance(cumulative_distance_short, cumulative_time_short);
-    float average_distance_mid = calculateAverageDistance(cumulative_distance_mid, cumulative_time_mid);
-    float average_distance_long = calculateAverageDistance(cumulative_distance_long, cumulative_time_long);
+    // Scale the accumulated distances to 16-bit
+    uint16_t scaled_distance_short = scaleToUint16(cumulative_distance_short, cumulative_time_short, SHORT_WINDOW);
+    uint16_t scaled_distance_mid = scaleToUint16(cumulative_distance_mid, cumulative_time_mid, MID_WINDOW);
+    uint16_t scaled_distance_long = scaleToUint16(cumulative_distance_long, cumulative_time_long, LONG_WINDOW);
 
     conn.beginPacket(dome_ip, 5005);
     conn.write(reinterpret_cast<uint8_t*>(&id), sizeof(id));
@@ -107,27 +108,10 @@ void loop(void)
     conn.write(reinterpret_cast<uint8_t*>(&z), sizeof(z));
     conn.write(reinterpret_cast<uint8_t*>(&action_flag), sizeof(action_flag));
 
-   
-    /*
-    uint16_t val1 = 2;
-    uint16_t val2 = 32767;
-    uint16_t val3 = 52767;
-    
-    
-    uint16_t val1 = htons(2);
-    uint16_t val2 = htons(32767);
-    uint16_t val3 = htons(52767);
-    
-    conn.write(reinterpret_cast<uint8_t*>(&val1), sizeof(val1));
-    conn.write(reinterpret_cast<uint8_t*>(&val2), sizeof(val2));
-    conn.write(reinterpret_cast<uint8_t*>(&val3), sizeof(val3));
-    */
-    
-
-    // Send the average angular distances for different windows
-    conn.write(reinterpret_cast<uint8_t*>(&average_distance_short), sizeof(average_distance_short));
-    conn.write(reinterpret_cast<uint8_t*>(&average_distance_mid), sizeof(average_distance_mid));
-    conn.write(reinterpret_cast<uint8_t*>(&average_distance_long), sizeof(average_distance_long));
+    // Send the scaled average angular distances for different windows
+    conn.write(reinterpret_cast<uint8_t*>(&scaled_distance_short), sizeof(scaled_distance_short));
+    conn.write(reinterpret_cast<uint8_t*>(&scaled_distance_mid), sizeof(scaled_distance_mid));
+    conn.write(reinterpret_cast<uint8_t*>(&scaled_distance_long), sizeof(scaled_distance_long));
     
     conn.endPacket();
 
@@ -140,18 +124,30 @@ void loop(void)
   }
 }
 
-void updateWindow(float &cumulative_distance, unsigned long &cumulative_time, float angle, unsigned long time_diff, unsigned long window_limit) {
+int32_t calculateScaledAngle(int32_t dot_product) {
+  // Ensure dot_product is within valid range
+  dot_product = fminf(fmaxf(dot_product, -16384 * 16384), 16384 * 16384);
+  // Scale the angle as an integer (e.g., 1 degree = 100 units)
+  // Here we assume dot_product is between -1 and 1 after scaling, we can calculate angle in "scaled units"
+  return (int32_t)(acos((float)dot_product / (16384.0f * 16384.0f)) * (MAX_ANGLE_INT / 6.28319f));
+}
+
+void updateWindow(uint32_t &cumulative_distance, uint32_t &cumulative_time, uint32_t angle, unsigned long time_diff, unsigned long window_limit) {
   cumulative_distance += angle;
   cumulative_time += time_diff;
 
   // If cumulative time exceeds window limit, scale down
   if (cumulative_time > window_limit) {
-    float scale_factor = (float)window_limit / cumulative_time;
-    cumulative_distance *= scale_factor;
+    uint32_t scale_factor = (cumulative_time / window_limit);
+    cumulative_distance /= scale_factor;
     cumulative_time = window_limit;
   }
 }
 
-float calculateAverageDistance(float cumulative_distance, unsigned long cumulative_time) {
-  return cumulative_time > 0 ? cumulative_distance / (cumulative_time / 1000.0) : 0.0f;
+uint16_t scaleToUint16(uint32_t cumulative_distance, uint32_t cumulative_time, unsigned long window_limit) {
+  if (cumulative_time == 0) return 0;
+  
+  // Scale the cumulative distance to a 16-bit range
+  uint32_t average_distance = cumulative_distance / (cumulative_time / 1000.0);  // Get average distance per second
+  return (uint16_t)((average_distance * 65535) / MAX_ANGLE_INT);
 }
